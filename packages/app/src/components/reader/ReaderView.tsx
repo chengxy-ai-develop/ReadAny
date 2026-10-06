@@ -2265,20 +2265,38 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         pendingTTSContinueSafetyTimerRef.current = null;
       }
       goToCFISafely(targetCfi);
-      await new Promise((resolve) => setTimeout(resolve, 280));
-      const segments =
-        (await foliateRef.current?.getVisibleTTSSegments(targetCfi))?.map((segment) => ({
-          text: segment.text.trim(),
-          cfi: segment.cfi,
-        })) ?? [];
+
+      // 等到锚点句真正落进当前视口再取段。原来固定等 280ms，在云引擎（每句一次
+      // 网络往返）加上重排较慢的页面上不够用：getVisibleTTSSegments 会回退成
+      // "整页可见段"，而把整页当播放队列就会把刚念完的内容从头再念一遍
+      // （症状：读到一半跳回去重读）。
+      const anchorText = (targetText || "").trim();
+      const matchesAnchor = (segment: { text: string; cfi: string }) =>
+        segment.cfi === targetCfi || (anchorText.length > 0 && segment.text === anchorText);
+      const anchorDeadline = Date.now() + 1200;
+      let segments: Array<{ text: string; cfi: string }> = [];
+      for (;;) {
+        segments =
+          (await foliateRef.current?.getVisibleTTSSegments(targetCfi))?.map((segment) => ({
+            text: segment.text.trim(),
+            cfi: segment.cfi,
+          })) ?? [];
+        if (segments.some(matchesAnchor) || Date.now() >= anchorDeadline) break;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+
       const visibleSegments = segments.filter((segment) => segment.text.length > 0);
-      const playbackSegments = visibleSegments.length
-        ? visibleSegments
-        : [{ text: (targetText || "").trim(), cfi: targetCfi }].filter(
-            (segment) => segment.text.length > 0,
-          );
-      if (!playbackSegments.length) return;
+      const anchorIndex = visibleSegments.findIndex(matchesAnchor);
       const context = await foliateRef.current?.getTTSSegmentContext(targetCfi, 10, 10);
+      // 严格从锚点句开始播。找不到锚点时退化为"锚点句本身 + 之后可见的段"，
+      // 绝不把锚点之前的已读内容重新排进队列。
+      const playbackSegments =
+        anchorIndex >= 0
+          ? visibleSegments.slice(anchorIndex)
+          : [{ text: anchorText, cfi: targetCfi }, ...(context?.after ?? [])].filter(
+              (segment) => segment.text.length > 0,
+            );
+      if (!playbackSegments.length) return;
       const previous = filterDistinctTTSSegments(context?.before || [], playbackSegments);
       const future = filterDistinctTTSSegments(context?.after || [], previous, playbackSegments);
       const nextText = playbackSegments
